@@ -1,0 +1,198 @@
+<!DOCTYPE html>
+<html lang="nl">
+<head>
+<meta charset="UTF-8">
+<title>OSDP Access Control</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+
+<style>
+body {
+    font-family: Arial, sans-serif;
+    margin: 20px;
+    background: #f4f6f8;
+}
+
+h2 {
+    margin-top: 30px;
+}
+
+.card {
+    background: white;
+    padding: 15px;
+    border-radius: 8px;
+    margin-bottom: 20px;
+    box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+}
+
+button {
+    padding: 8px 12px;
+    border: none;
+    border-radius: 5px;
+    background: #007bff;
+    color: white;
+    cursor: pointer;
+}
+
+button:hover {
+    background: #0056b3;
+}
+
+button.delete {
+    background: #dc3545;
+}
+
+button.delete:hover {
+    background: #a71d2a;
+}
+
+input {
+    padding: 8px;
+    width: 220px;
+    margin-right: 10px;
+}
+
+ul {
+    list-style: none;
+    padding: 0;
+}
+
+li {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 6px 0;
+    border-bottom: 1px solid #eee;
+    font-family: monospace;
+}
+
+.status {
+    margin-top: 10px;
+    font-size: 14px;
+    color: #555;
+}
+</style>
+</head>
+
+<body>
+
+<h1>Access Control</h1>
+
+<div class="card">
+    <h2>Kaarten (whitelist)</h2>
+    <ul id="cards"></ul>
+</div>
+
+<div class="card">
+    <h2>Kaart toevoegen</h2>
+    <input id="uid" placeholder="bijv. F5E7E8D329">
+    <button onclick="addCard()">Toevoegen</button>
+</div>
+
+<div class="card">
+    <h2>Kaart inleren</h2>
+    <button onclick="learn()">Inleren</button>
+</div>
+
+<div class="card">
+    <h2>Deur</h2>
+    <button onclick="openDoor()">Open deur</button>
+    <div id="status" class="status"></div>
+</div>
+
+<div class="card">
+    <h2>Laatste scans</h2>
+    <ul id="log"></ul>
+</div>
+
+<script>
+
+// ===== CARDS =====
+function loadCards() {
+    fetch('/cards')
+        .then(res => res.json())
+        .then(data => {
+            const container = document.getElementById('cards');
+            container.innerHTML = '';
+
+            data.forEach(uid => {
+                const li = document.createElement('li');
+
+                li.innerHTML = `
+                    <span>${uid}</span>
+                    <button class="delete" onclick="deleteCard('${uid}')">Delete</button>
+                `;
+
+                container.appendChild(li);
+            });
+        });
+}
+
+function deleteCard(uid) {
+    if (!confirm("Kaart verwijderen?\n" + uid)) return;
+
+    fetch('/delete?uid=' + uid)
+        .then(() => loadCards());
+}
+
+// ===== LOG =====
+async function loadLog() {
+    let res = await fetch('/log');
+    let data = await res.json();
+
+    let html = "";
+    data.reverse().forEach(c => {
+        html += "<li>" + c + "</li>";
+    });
+
+    document.getElementById('log').innerHTML = html;
+}
+
+// ===== ADD =====
+async function addCard() {
+    let uid = document.getElementById('uid').value.trim().toUpperCase();
+
+    if (!/^[0-9A-F]{10}$/.test(uid)) {
+        alert("UID moet 10 hex tekens zijn");
+        return;
+    }
+
+    await fetch('/add?uid=' + uid);
+
+    document.getElementById('uid').value = "";
+    loadCards();
+}
+
+// ===== LEARN =====
+async function learn() {
+    await fetch('/learn');
+    setStatus("Scan nu een kaart...");
+}
+
+// ===== DOOR =====
+function openDoor() {
+    fetch('/open')
+        .then(res => res.text())
+        .then(txt => setStatus(txt));
+}
+
+// ===== STATUS =====
+function setStatus(msg) {
+    document.getElementById('status').innerText = msg;
+}
+
+// ===== REFRESH =====
+function refresh() {
+    loadCards();
+    loadLog();
+}
+
+// initial load
+refresh();
+
+// auto refresh
+setInterval(refresh, 2000);
+
+</script>
+
+</body>
+</html>
