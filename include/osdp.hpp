@@ -109,6 +109,21 @@ public:
 		return osdp_cp_submit_command(_ctx, pd, cmd);
 	}
 
+	int disable_pd(int pd)
+	{
+		return osdp_cp_disable_pd(_ctx, pd);
+	}
+
+	int enable_pd(int pd)
+	{
+		return osdp_cp_enable_pd(_ctx, pd);
+	}
+
+	bool is_pd_enabled(int pd)
+	{
+		return osdp_cp_is_pd_enabled(_ctx, pd);
+	}
+
 	void set_event_callback(cp_event_callback_t cb, void *arg)
 	{
 		osdp_cp_set_event_callback(_ctx, cb, arg);
