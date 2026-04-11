@@ -22,6 +22,7 @@
 #define RXD2 16
 #define TXD2 17
 #define RS485_DE_PIN 4
+#define PD_ADDRESS 1
 #define LOG_SIZE 20
 #define CMD_POOL_SIZE 8
 #define LEARN_TIMEOUT 10000
@@ -29,6 +30,7 @@
 #define WIFI_CONNECT_TIMEOUT_MS 15000
 #define PD_RECOVERY_DISABLE_DELAY_MS 250
 #define PD_RECOVERY_ENABLE_DELAY_MS 250
+#define STATUS_QUERY_INTERVAL_MS 2000
 
 #ifndef WEB_USERNAME
 #define WEB_USERNAME ""
@@ -56,11 +58,18 @@ bool learn_mode = false;
 bool door_active = false;
 bool pd_recovery_pending = false;
 bool pd_recovery_disable_sent = false;
+bool pd_id_valid = false;
+bool local_tamper_known = false;
+bool local_tamper_active = false;
+bool local_power_known = false;
+bool local_power_ok = false;
 
 uint32_t door_open_time = 0;
 uint32_t learn_start = 0;
 uint32_t last_action_time = 0;
 uint32_t pd_recovery_at = 0;
+uint32_t last_status_query_time = 0;
+osdp_pd_id pd_identity = {};
 
 // ===== STORAGE =====
 struct Card {
@@ -341,6 +350,12 @@ void init_webserver()
     bool pd_online_snapshot = false;
     bool learn_mode_snapshot = false;
     bool door_active_snapshot = false;
+    bool pd_id_valid_snapshot = false;
+    bool local_tamper_known_snapshot = false;
+    bool local_tamper_active_snapshot = false;
+    bool local_power_known_snapshot = false;
+    bool local_power_ok_snapshot = false;
+    osdp_pd_id pd_identity_snapshot = {};
 
     if (!lock_state()) {
         request->send(503, "text/plain", "state busy");
@@ -349,6 +364,12 @@ void init_webserver()
     pd_online_snapshot = pd_online;
     learn_mode_snapshot = learn_mode;
     door_active_snapshot = door_active;
+    pd_id_valid_snapshot = pd_id_valid;
+    local_tamper_known_snapshot = local_tamper_known;
+    local_tamper_active_snapshot = local_tamper_active;
+    local_power_known_snapshot = local_power_known;
+    local_power_ok_snapshot = local_power_ok;
+    pd_identity_snapshot = pd_identity;
     unlock_state();
 
     String json = "{";
@@ -358,6 +379,26 @@ void init_webserver()
     json += learn_mode_snapshot ? "true" : "false";
     json += ",\"doorActive\":";
     json += door_active_snapshot ? "true" : "false";
+    json += ",\"tamperKnown\":";
+    json += local_tamper_known_snapshot ? "true" : "false";
+    json += ",\"tamperActive\":";
+    json += local_tamper_active_snapshot ? "true" : "false";
+    json += ",\"powerKnown\":";
+    json += local_power_known_snapshot ? "true" : "false";
+    json += ",\"powerOk\":";
+    json += local_power_ok_snapshot ? "true" : "false";
+    json += ",\"pdIdValid\":";
+    json += pd_id_valid_snapshot ? "true" : "false";
+    json += ",\"vendorCode\":\"";
+    json += pd_id_valid_snapshot ? String(pd_identity_snapshot.vendor_code, HEX) : "";
+    json += "\",\"serialNumber\":";
+    json += pd_id_valid_snapshot ? String(pd_identity_snapshot.serial_number) : "0";
+    json += ",\"firmwareVersion\":\"";
+    json += pd_id_valid_snapshot ? String(pd_identity_snapshot.firmware_version, HEX) : "";
+    json += "\",\"model\":";
+    json += pd_id_valid_snapshot ? String(pd_identity_snapshot.model) : "0";
+    json += ",\"version\":";
+    json += pd_id_valid_snapshot ? String(pd_identity_snapshot.version) : "0";
     json += "}";
 
     request->send(200, "application/json", json);
@@ -510,6 +551,92 @@ void clear_serial2_rx()
     }
 }
 
+void query_local_status()
+{
+    osdp_cmd *cmd = get_cmd();
+    cmd->id = OSDP_CMD_STATUS;
+    cmd->status.type = OSDP_STATUS_REPORT_LOCAL;
+    cp.submit_command(0, cmd);
+}
+
+const char *capability_name(uint8_t function_code)
+{
+    switch (function_code) {
+        case OSDP_PD_CAP_CONTACT_STATUS_MONITORING:
+            return "Contact status monitoring";
+        case OSDP_PD_CAP_OUTPUT_CONTROL:
+            return "Output control";
+        case OSDP_PD_CAP_CARD_DATA_FORMAT:
+            return "Card data format";
+        case OSDP_PD_CAP_READER_LED_CONTROL:
+            return "Reader LED control";
+        case OSDP_PD_CAP_READER_AUDIBLE_OUTPUT:
+            return "Reader audible output";
+        case OSDP_PD_CAP_READER_TEXT_OUTPUT:
+            return "Reader text output";
+        case OSDP_PD_CAP_TIME_KEEPING:
+            return "Time keeping";
+        case OSDP_PD_CAP_CHECK_CHARACTER_SUPPORT:
+            return "Checksum/CRC support";
+        case OSDP_PD_CAP_COMMUNICATION_SECURITY:
+            return "Communication security";
+        case OSDP_PD_CAP_RECEIVE_BUFFERSIZE:
+            return "Receive buffer size";
+        case OSDP_PD_CAP_LARGEST_COMBINED_MESSAGE_SIZE:
+            return "Largest combined message size";
+        case OSDP_PD_CAP_SMART_CARD_SUPPORT:
+            return "Smart card support";
+        case OSDP_PD_CAP_READERS:
+            return "Readers";
+        case OSDP_PD_CAP_BIOMETRICS:
+            return "Biometrics";
+        case OSDP_PD_CAP_SECURE_PIN_ENTRY:
+            return "Secure PIN entry";
+        case OSDP_PD_CAP_OSDP_VERSION:
+            return "OSDP version";
+        default:
+            return "Unknown";
+    }
+}
+
+void dump_pd_info_and_capabilities()
+{
+    osdp_pd_id id = {};
+    if (cp.get_pd_id(0, &id) == 0) {
+        if (lock_state()) {
+            pd_identity = id;
+            pd_id_valid = true;
+            unlock_state();
+        }
+        Serial.printf(
+            "PD ID: version=%d model=%d vendor=0x%06lX serial=%lu firmware=0x%06lX\n",
+            id.version,
+            id.model,
+            static_cast<unsigned long>(id.vendor_code),
+            static_cast<unsigned long>(id.serial_number),
+            static_cast<unsigned long>(id.firmware_version)
+        );
+    } else {
+        Serial.println("PD ID: unavailable");
+    }
+
+    Serial.println("PD capabilities:");
+    for (uint8_t fc = OSDP_PD_CAP_CONTACT_STATUS_MONITORING;
+         fc < OSDP_PD_CAP_SENTINEL;
+         fc++) {
+        osdp_pd_cap cap = {};
+        cap.function_code = fc;
+        if (cp.get_capability(0, &cap) == 0 && cap.compliance_level != 0) {
+            Serial.printf(
+                "  - %s: compliance=%u items=%u\n",
+                capability_name(fc),
+                cap.compliance_level,
+                cap.num_items
+            );
+        }
+    }
+}
+
 void osdp_task(void *param)
 {
     while (true) {
@@ -518,6 +645,8 @@ void osdp_task(void *param)
 
         bool do_init_led = false;
         bool do_online_beep = false;
+        bool do_dump_pd_info = false;
+        bool do_query_local_status = false;
         Action action_to_run = ACTION_NONE;
         bool do_pd_disable = false;
         bool do_pd_enable = false;
@@ -528,6 +657,8 @@ void osdp_task(void *param)
                 init_done = true;
                 do_init_led = true;
                 do_online_beep = true;
+                do_dump_pd_info = true;
+                do_query_local_status = true;
             }
 
             // learn timeout
@@ -555,6 +686,12 @@ void osdp_task(void *param)
                 } else if (!cp.is_pd_enabled(0)) {
                     do_pd_enable = true;
                 }
+            }
+
+            if (pd_online &&
+                millis() - last_status_query_time >= STATUS_QUERY_INTERVAL_MS) {
+                last_status_query_time = millis();
+                do_query_local_status = true;
             }
 
             unlock_state();
@@ -593,6 +730,14 @@ void osdp_task(void *param)
 
         if (do_online_beep) {
             buzzer_beep();
+        }
+
+        if (do_dump_pd_info) {
+            dump_pd_info_and_capabilities();
+        }
+
+        if (do_query_local_status) {
+            query_local_status();
         }
 
         bool should_lock_door = false;
@@ -670,9 +815,12 @@ int serial1_recv_func(void * /* data */, uint8_t *buf, int maxlen)
 
 void init_cp_info()
 {
-    pd_info[0].name = "pd[1]";
+    static char pd_name[16];
+    snprintf(pd_name, sizeof(pd_name), "pd[%u]", PD_ADDRESS);
+
+    pd_info[0].name = pd_name;
     pd_info[0].baud_rate = 9600;
-    pd_info[0].address = 1;
+    pd_info[0].address = PD_ADDRESS;
     pd_info[0].id.version = 0;
     pd_info[0].id.model = 0;
     pd_info[0].id.vendor_code = 0;
@@ -697,11 +845,14 @@ int event_handler(void * /* data */, int /* pd */, struct osdp_event *event)
                 if (pd_online) {
                     pd_recovery_pending = false;
                     pd_recovery_disable_sent = false;
+                    last_status_query_time = 0;
                 } else {
                     init_done = false;
                     pd_recovery_pending = true;
                     pd_recovery_disable_sent = false;
                     pd_recovery_at = millis() + PD_RECOVERY_DISABLE_DELAY_MS;
+                    local_tamper_known = false;
+                    local_power_known = false;
                 }
                 unlock_state();
             }
@@ -741,6 +892,25 @@ int event_handler(void * /* data */, int /* pd */, struct osdp_event *event)
         }
 
         unlock_state();
+    }
+
+    if (event->type == OSDP_EVENT_STATUS) {
+        if (event->status.type == OSDP_STATUS_REPORT_LOCAL &&
+            event->status.nr_entries >= 2) {
+            if (lock_state()) {
+                local_tamper_known = true;
+                local_tamper_active = event->status.report[0] != 0;
+                local_power_known = true;
+                local_power_ok = event->status.report[1] != 0;
+                unlock_state();
+            }
+
+            Serial.printf(
+                "Local status: tamper=%s power=%s\n",
+                event->status.report[0] ? "ACTIVE" : "NORMAL",
+                event->status.report[1] ? "OK" : "FAULT"
+            );
+        }
     }
 
     return 0;
@@ -791,7 +961,3 @@ void setup()
 void loop() {
     delay(100);
 }
-
-
-
-

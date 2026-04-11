@@ -116,6 +116,38 @@ li {
     flex-wrap: wrap;
 }
 
+.stack {
+    display: grid;
+    gap: 10px;
+}
+
+.meta-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    gap: 10px;
+    margin-top: 12px;
+}
+
+.meta-item {
+    background: #f8fafc;
+    border-radius: 8px;
+    padding: 10px 12px;
+}
+
+.meta-label {
+    font-size: 12px;
+    color: #6b7280;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    margin-bottom: 4px;
+}
+
+.meta-value {
+    font-family: monospace;
+    font-size: 14px;
+    word-break: break-word;
+}
+
 .notice {
     margin-top: 10px;
     padding: 10px 12px;
@@ -150,8 +182,23 @@ li {
     <h2>Status</h2>
     <div class="inline-row">
         <span id="readerState" class="pill offline">Reader offline</span>
+        <span id="tamperState" class="pill pending">Tamper unknown</span>
         <span id="learnState" class="pill offline">Learn mode off</span>
         <span id="doorState" class="pill offline">Door closed</span>
+    </div>
+    <div class="meta-grid">
+        <div class="meta-item">
+            <div class="meta-label">Vendor</div>
+            <div id="vendorCode" class="meta-value">Unknown</div>
+        </div>
+        <div class="meta-item">
+            <div class="meta-label">Serial</div>
+            <div id="serialNumber" class="meta-value">Unknown</div>
+        </div>
+        <div class="meta-item">
+            <div class="meta-label">Firmware</div>
+            <div id="firmwareVersion" class="meta-value">Unknown</div>
+        </div>
     </div>
     <div id="globalStatus" class="notice info" style="display:none;"></div>
     <div id="globalError" class="notice error" style="display:none;"></div>
@@ -163,20 +210,21 @@ li {
 </div>
 
 <div class="card">
-    <h2>Add card</h2>
-    <input id="uid" placeholder="e.g. F5E7E8D329">
-    <button onclick="addCard()">Add</button>
-</div>
-
-<div class="card">
-    <h2>Learn card</h2>
-    <button onclick="learn()">Learn</button>
+    <h2>Card management</h2>
+    <div class="stack">
+        <div class="inline-row">
+            <input id="uid" placeholder="e.g. F5E7E8D329">
+            <button onclick="addCard()">Add card</button>
+            <button onclick="learn()">Learn card</button>
+        </div>
+        <div id="cardStatus" class="status">Use "Add card" for a known UID, or "Learn card" and then present a badge.</div>
+    </div>
 </div>
 
 <div class="card">
     <h2>Door</h2>
     <button onclick="openDoor()">Open door</button>
-    <div id="status" class="status">Ready.</div>
+    <div id="doorStatus" class="status">Ready.</div>
 </div>
 
 <div class="card">
@@ -190,7 +238,13 @@ let statusEndpointAvailable = true;
 let statusState = {
     readerOnline: null,
     learnMode: false,
-    doorActive: false
+    doorActive: false,
+    tamperKnown: false,
+    tamperActive: false,
+    pdIdValid: false,
+    vendorCode: '',
+    serialNumber: 0,
+    firmwareVersion: ''
 };
 let learnModeTimer = null;
 let doorTimer = null;
@@ -211,9 +265,13 @@ async function apiFetch(url, options = {}) {
     return text;
 }
 
-function setStatus(msg) {
-    document.getElementById('status').innerText = msg;
+function setDoorStatus(msg) {
+    document.getElementById('doorStatus').innerText = msg;
     showGlobalStatus(msg);
+}
+
+function setCardStatus(msg) {
+    document.getElementById('cardStatus').innerText = msg;
 }
 
 function showGlobalStatus(msg) {
@@ -263,11 +321,34 @@ function renderStatus() {
         statusState.learnMode ? 'pending' : 'offline'
     );
 
+    if (!statusState.tamperKnown) {
+        setPill('tamperState', 'Tamper unknown', 'pending');
+    } else {
+        setPill(
+            'tamperState',
+            statusState.tamperActive ? 'Tamper active' : 'Tamper normal',
+            statusState.tamperActive ? 'offline' : 'online'
+        );
+    }
+
     setPill(
         'doorState',
         statusState.doorActive ? 'Door open' : 'Door closed',
         statusState.doorActive ? 'pending' : 'offline'
     );
+
+    document.getElementById('vendorCode').innerText =
+        statusState.pdIdValid && statusState.vendorCode
+            ? '0x' + statusState.vendorCode.toUpperCase()
+            : 'Unknown';
+    document.getElementById('serialNumber').innerText =
+        statusState.pdIdValid && statusState.serialNumber
+            ? String(statusState.serialNumber)
+            : 'Unknown';
+    document.getElementById('firmwareVersion').innerText =
+        statusState.pdIdValid && statusState.firmwareVersion
+            ? '0x' + statusState.firmwareVersion.toUpperCase()
+            : 'Unknown';
 }
 
 function markLearnModeActive() {
@@ -335,7 +416,7 @@ async function deleteCard(uid) {
         setBusy(true);
         showGlobalError('');
         const result = await apiFetch('/delete?uid=' + uid);
-        setStatus(result);
+        setCardStatus(result === 'deleted' ? 'Card deleted.' : result);
         await refresh();
     } catch (err) {
         showGlobalError('Failed to delete card: ' + err.message);
@@ -374,6 +455,12 @@ async function loadReaderStatus() {
         statusState.readerOnline = status.readerOnline;
         statusState.learnMode = status.learnMode;
         statusState.doorActive = status.doorActive;
+        statusState.tamperKnown = status.tamperKnown;
+        statusState.tamperActive = status.tamperActive;
+        statusState.pdIdValid = status.pdIdValid;
+        statusState.vendorCode = status.vendorCode || '';
+        statusState.serialNumber = status.serialNumber || 0;
+        statusState.firmwareVersion = status.firmwareVersion || '';
         renderStatus();
     } catch (err) {
         if (err.message === 'not found') {
@@ -403,7 +490,7 @@ async function addCard() {
         showGlobalError('');
         const result = await apiFetch('/add?uid=' + uid);
         uidInput.value = "";
-        setStatus(result === 'ok' ? 'Card added.' : result);
+        setCardStatus(result === 'ok' ? 'Card added.' : result);
         await refresh();
     } catch (err) {
         showGlobalError('Failed to add card: ' + err.message);
@@ -419,7 +506,7 @@ async function learn() {
         showGlobalError('');
         await apiFetch('/learn');
         markLearnModeActive();
-        setStatus("Present a card now...");
+        setCardStatus("Present a card now...");
         await refresh();
     } catch (err) {
         showGlobalError('Failed to start learn mode: ' + err.message);
@@ -435,7 +522,7 @@ async function openDoor() {
         showGlobalError('');
         const txt = await apiFetch('/open');
         markDoorActive();
-        setStatus(txt);
+        setDoorStatus(txt);
         await refresh();
     } catch (err) {
         showGlobalError('Failed to trigger door: ' + err.message);
