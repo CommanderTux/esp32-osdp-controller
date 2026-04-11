@@ -68,7 +68,6 @@ struct Card {
 };
 struct LogEntry {
     uint8_t uid[UID_LEN];
-    uint32_t timestamp;
 };
 std::vector<Card> allowed_cards;
 LogEntry log_buffer[LOG_SIZE];
@@ -183,7 +182,7 @@ enum Action {
     ACTION_LEARN_DUP
 };
 
-volatile Action pending_action = ACTION_NONE;
+Action pending_action = ACTION_NONE;
 
 void init_wifi() {
     if (strlen(WIFI_SSID) == 0 || strlen(WIFI_PASSWORD) == 0) {
@@ -216,9 +215,13 @@ void init_fs() {
 
 void door_unlock()
 {
+    if (lock_state()) {
+        door_active = true;
+        door_open_time = millis();
+        unlock_state();
+    }
+
     digitalWrite(DOOR_PIN, HIGH);
-    door_active = true;
-    door_open_time = millis();
 
     Serial.println("Door unlocked");
 }
@@ -269,13 +272,9 @@ bool remove_card(uint8_t *uid)
     return false;
 }
 
-bool card_equals(const uint8_t *a, const uint8_t *b) {
-    return memcmp(a, b, UID_LEN) == 0;
-}
-
 bool is_allowed(uint8_t *uid) {
     for (auto &c : allowed_cards) {
-        if (card_equals(c.uid, uid)) return true;
+        if (memcmp(c.uid, uid, UID_LEN) == 0) return true;
     }
     return false;
 }
@@ -292,7 +291,6 @@ void add_card(uint8_t *uid) {
 
 void add_log(uint8_t *uid) {
     memcpy(log_buffer[log_index].uid, uid, UID_LEN);
-    log_buffer[log_index].timestamp = millis();
     log_index = (log_index + 1) % LOG_SIZE;
     if (log_count < LOG_SIZE) {
         log_count++;
@@ -332,6 +330,36 @@ void init_webserver()
     }
 
     json += "]";
+    request->send(200, "application/json", json);
+    });
+
+    server.on("/status", HTTP_GET, [](AsyncWebServerRequest *request){
+    if (!authorize_request(request)) {
+        return;
+    }
+
+    bool pd_online_snapshot = false;
+    bool learn_mode_snapshot = false;
+    bool door_active_snapshot = false;
+
+    if (!lock_state()) {
+        request->send(503, "text/plain", "state busy");
+        return;
+    }
+    pd_online_snapshot = pd_online;
+    learn_mode_snapshot = learn_mode;
+    door_active_snapshot = door_active;
+    unlock_state();
+
+    String json = "{";
+    json += "\"readerOnline\":";
+    json += pd_online_snapshot ? "true" : "false";
+    json += ",\"learnMode\":";
+    json += learn_mode_snapshot ? "true" : "false";
+    json += ",\"doorActive\":";
+    json += door_active_snapshot ? "true" : "false";
+    json += "}";
+
     request->send(200, "application/json", json);
     });
 
@@ -443,21 +471,6 @@ void init_webserver()
     });
 }
 
-// void led_set_idle()
-// {
-//     osdp_cmd *cmd = get_cmd();
-
-//     cmd->id = OSDP_CMD_LED;
-//     cmd->led.reader = 0;
-//     cmd->led.led_number = 0;
-
-//     cmd->led.permanent.control_code = 1;
-//     cmd->led.permanent.on_color = OSDP_LED_COLOR_BLUE;
-//     cmd->led.permanent.off_color = OSDP_LED_COLOR_NONE;
-
-//     cp.submit_command(0, cmd);
-// }
-
 void led_feedback(uint8_t color)
 {
     osdp_cmd *cmd = get_cmd();
@@ -504,6 +517,7 @@ void osdp_task(void *param)
         cp.refresh();
 
         bool do_init_led = false;
+        bool do_online_beep = false;
         Action action_to_run = ACTION_NONE;
         bool do_pd_disable = false;
         bool do_pd_enable = false;
@@ -513,6 +527,7 @@ void osdp_task(void *param)
             if (pd_online && !init_done) {
                 init_done = true;
                 do_init_led = true;
+                do_online_beep = true;
             }
 
             // learn timeout
@@ -576,9 +591,21 @@ void osdp_task(void *param)
             led_feedback(OSDP_LED_COLOR_BLUE);
         }
 
-        if (door_active && millis() - door_open_time > DOOR_OPEN_TIME) {
+        if (do_online_beep) {
+            buzzer_beep();
+        }
+
+        bool should_lock_door = false;
+        if (lock_state(pdMS_TO_TICKS(10))) {
+            if (door_active && millis() - door_open_time > DOOR_OPEN_TIME) {
+                door_active = false;
+                should_lock_door = true;
+            }
+            unlock_state();
+        }
+
+        if (should_lock_door) {
             digitalWrite(DOOR_PIN, LOW);
-            door_active = false;
             Serial.println("Door locked");
         }
         
@@ -615,7 +642,7 @@ void osdp_task(void *param)
     }
 }
 
-int serial1_send_func(void *data, uint8_t *buf, int len)
+int serial1_send_func(void * /* data */, uint8_t *buf, int len)
 {
     digitalWrite(RS485_DE_PIN, HIGH);
     delayMicroseconds(50);
@@ -629,7 +656,7 @@ int serial1_send_func(void *data, uint8_t *buf, int len)
     return len;
 }
 
-int serial1_recv_func(void *data, uint8_t *buf, int maxlen)
+int serial1_recv_func(void * /* data */, uint8_t *buf, int maxlen)
 {
     int available = Serial2.available();
 
@@ -661,7 +688,7 @@ void init_cp_info()
     cp_channel.flush = NULL;
 }
 
-int event_handler(void *data, int pd, struct osdp_event *event)
+int event_handler(void * /* data */, int /* pd */, struct osdp_event *event)
 {
     if (event->type == OSDP_EVENT_NOTIFICATION) {
         if (event->notif.type == OSDP_EVENT_NOTIFICATION_PD_STATUS) {
@@ -723,6 +750,12 @@ void setup()
 {
     Serial.begin(115200);
     state_mutex = xSemaphoreCreateMutex();
+    if (state_mutex == nullptr) {
+        Serial.println("Failed to create state mutex");
+        while (true) {
+            delay(1000);
+        }
+    }
 
     pinMode(DOOR_PIN, OUTPUT);
     digitalWrite(DOOR_PIN, LOW);  // deur dicht
@@ -758,9 +791,6 @@ void setup()
 void loop() {
     delay(100);
 }
-
-
-
 
 
 

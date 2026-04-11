@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="nl">
+<html lang="en">
 <head>
 <meta charset="UTF-8">
 <title>OSDP Access Control</title>
@@ -10,10 +10,15 @@ body {
     font-family: Arial, sans-serif;
     margin: 20px;
     background: #f4f6f8;
+    color: #1f2937;
 }
 
 h2 {
     margin-top: 30px;
+}
+
+h1 {
+    margin-bottom: 8px;
 }
 
 .card {
@@ -35,6 +40,11 @@ button {
 
 button:hover {
     background: #0056b3;
+}
+
+button:disabled {
+    opacity: 0.6;
+    cursor: wait;
 }
 
 button.delete {
@@ -70,123 +80,386 @@ li {
     font-size: 14px;
     color: #555;
 }
+
+.subtitle {
+    color: #6b7280;
+    margin-bottom: 20px;
+}
+
+.pill {
+    display: inline-block;
+    padding: 6px 10px;
+    border-radius: 999px;
+    font-size: 13px;
+    font-weight: bold;
+}
+
+.pill.online {
+    background: #dcfce7;
+    color: #166534;
+}
+
+.pill.offline {
+    background: #fee2e2;
+    color: #991b1b;
+}
+
+.pill.pending {
+    background: #fef3c7;
+    color: #92400e;
+}
+
+.inline-row {
+    display: flex;
+    gap: 10px;
+    align-items: center;
+    flex-wrap: wrap;
+}
+
+.notice {
+    margin-top: 10px;
+    padding: 10px 12px;
+    border-radius: 6px;
+    font-size: 14px;
+}
+
+.notice.info {
+    background: #eff6ff;
+    color: #1d4ed8;
+}
+
+.notice.error {
+    background: #fee2e2;
+    color: #b91c1c;
+}
+
+.empty {
+    color: #6b7280;
+    font-style: italic;
+    padding: 6px 0;
+}
 </style>
 </head>
 
 <body>
 
 <h1>Access Control</h1>
+<div class="subtitle">OSDP door controller with card management, logbook, and reader status.</div>
 
 <div class="card">
-    <h2>Kaarten (whitelist)</h2>
+    <h2>Status</h2>
+    <div class="inline-row">
+        <span id="readerState" class="pill offline">Reader offline</span>
+        <span id="learnState" class="pill offline">Learn mode off</span>
+        <span id="doorState" class="pill offline">Door closed</span>
+    </div>
+    <div id="globalStatus" class="notice info" style="display:none;"></div>
+    <div id="globalError" class="notice error" style="display:none;"></div>
+</div>
+
+<div class="card">
+    <h2>Cards (whitelist)</h2>
     <ul id="cards"></ul>
 </div>
 
 <div class="card">
-    <h2>Kaart toevoegen</h2>
-    <input id="uid" placeholder="bijv. F5E7E8D329">
-    <button onclick="addCard()">Toevoegen</button>
+    <h2>Add card</h2>
+    <input id="uid" placeholder="e.g. F5E7E8D329">
+    <button onclick="addCard()">Add</button>
 </div>
 
 <div class="card">
-    <h2>Kaart inleren</h2>
-    <button onclick="learn()">Inleren</button>
+    <h2>Learn card</h2>
+    <button onclick="learn()">Learn</button>
 </div>
 
 <div class="card">
-    <h2>Deur</h2>
-    <button onclick="openDoor()">Open deur</button>
-    <div id="status" class="status"></div>
+    <h2>Door</h2>
+    <button onclick="openDoor()">Open door</button>
+    <div id="status" class="status">Ready.</div>
 </div>
 
 <div class="card">
-    <h2>Laatste scans</h2>
+    <h2>Recent scans</h2>
     <ul id="log"></ul>
 </div>
 
 <script>
+let busy = false;
+let statusEndpointAvailable = true;
+let statusState = {
+    readerOnline: null,
+    learnMode: false,
+    doorActive: false
+};
+let learnModeTimer = null;
+let doorTimer = null;
 
-// ===== CARDS =====
-function loadCards() {
-    fetch('/cards')
-        .then(res => res.json())
-        .then(data => {
-            const container = document.getElementById('cards');
-            container.innerHTML = '';
+async function apiFetch(url, options = {}) {
+    const response = await fetch(url, options);
+    const text = await response.text();
 
-            data.forEach(uid => {
-                const li = document.createElement('li');
+    if (!response.ok) {
+        throw new Error(text || `HTTP ${response.status}`);
+    }
 
-                li.innerHTML = `
-                    <span>${uid}</span>
-                    <button class="delete" onclick="deleteCard('${uid}')">Delete</button>
-                `;
+    const contentType = response.headers.get('content-type') || '';
+    if (contentType.includes('application/json')) {
+        return JSON.parse(text);
+    }
 
-                container.appendChild(li);
-            });
-        });
+    return text;
 }
 
-function deleteCard(uid) {
-    if (!confirm("Kaart verwijderen?\n" + uid)) return;
+function setStatus(msg) {
+    document.getElementById('status').innerText = msg;
+    showGlobalStatus(msg);
+}
 
-    fetch('/delete?uid=' + uid)
-        .then(() => loadCards());
+function showGlobalStatus(msg) {
+    const el = document.getElementById('globalStatus');
+    if (!msg) {
+        el.style.display = 'none';
+        el.innerText = '';
+        return;
+    }
+
+    el.innerText = msg;
+    el.style.display = 'block';
+}
+
+function showGlobalError(msg) {
+    const el = document.getElementById('globalError');
+    if (!msg) {
+        el.style.display = 'none';
+        el.innerText = '';
+        return;
+    }
+
+    el.innerText = msg;
+    el.style.display = 'block';
+}
+
+function setPill(id, label, kind) {
+    const el = document.getElementById(id);
+    el.className = `pill ${kind}`;
+    el.innerText = label;
+}
+
+function renderStatus() {
+    if (statusState.readerOnline === null) {
+        setPill('readerState', 'Reader status unavailable', 'pending');
+    } else {
+        setPill(
+            'readerState',
+            statusState.readerOnline ? 'Reader online' : 'Reader offline',
+            statusState.readerOnline ? 'online' : 'offline'
+        );
+    }
+
+    setPill(
+        'learnState',
+        statusState.learnMode ? 'Learn mode on' : 'Learn mode off',
+        statusState.learnMode ? 'pending' : 'offline'
+    );
+
+    setPill(
+        'doorState',
+        statusState.doorActive ? 'Door open' : 'Door closed',
+        statusState.doorActive ? 'pending' : 'offline'
+    );
+}
+
+function markLearnModeActive() {
+    statusState.learnMode = true;
+    renderStatus();
+
+    if (learnModeTimer) {
+        clearTimeout(learnModeTimer);
+    }
+
+    learnModeTimer = setTimeout(() => {
+        statusState.learnMode = false;
+        renderStatus();
+    }, 11000);
+}
+
+function markDoorActive() {
+    statusState.doorActive = true;
+    renderStatus();
+
+    if (doorTimer) {
+        clearTimeout(doorTimer);
+    }
+
+    doorTimer = setTimeout(() => {
+        statusState.doorActive = false;
+        renderStatus();
+    }, 3200);
+}
+
+function setBusy(nextBusy) {
+    busy = nextBusy;
+    document.querySelectorAll('button').forEach(button => {
+        button.disabled = nextBusy;
+    });
+}
+
+// ===== CARDS =====
+async function loadCards() {
+    const container = document.getElementById('cards');
+    const data = await apiFetch('/cards');
+    container.innerHTML = '';
+
+    if (!data.length) {
+        container.innerHTML = '<li class="empty">No cards stored yet.</li>';
+        return;
+    }
+
+    data.forEach(uid => {
+        const li = document.createElement('li');
+
+        li.innerHTML = `
+            <span>${uid}</span>
+            <button class="delete" onclick="deleteCard('${uid}')">Delete</button>
+        `;
+
+        container.appendChild(li);
+    });
+}
+
+async function deleteCard(uid) {
+    if (!confirm("Delete card?\n" + uid)) return;
+
+    try {
+        setBusy(true);
+        showGlobalError('');
+        const result = await apiFetch('/delete?uid=' + uid);
+        setStatus(result);
+        await refresh();
+    } catch (err) {
+        showGlobalError('Failed to delete card: ' + err.message);
+    } finally {
+        setBusy(false);
+    }
 }
 
 // ===== LOG =====
 async function loadLog() {
-    let res = await fetch('/log');
-    let data = await res.json();
+    const data = await apiFetch('/log');
+    const container = document.getElementById('log');
+
+    if (!data.length) {
+        container.innerHTML = '<li class="empty">No scans recorded yet.</li>';
+        return;
+    }
 
     let html = "";
-    data.reverse().forEach(c => {
+    data.slice().reverse().forEach(c => {
         html += "<li>" + c + "</li>";
     });
 
-    document.getElementById('log').innerHTML = html;
+    container.innerHTML = html;
+}
+
+// ===== READER STATUS =====
+async function loadReaderStatus() {
+    if (!statusEndpointAvailable) {
+        renderStatus();
+        return;
+    }
+
+    try {
+        const status = await apiFetch('/status');
+        statusState.readerOnline = status.readerOnline;
+        statusState.learnMode = status.learnMode;
+        statusState.doorActive = status.doorActive;
+        renderStatus();
+    } catch (err) {
+        if (err.message === 'not found') {
+            statusEndpointAvailable = false;
+            statusState.readerOnline = null;
+            renderStatus();
+            showGlobalStatus('Reader live status is unavailable on this firmware version.');
+            return;
+        }
+
+        throw err;
+    }
 }
 
 // ===== ADD =====
 async function addCard() {
-    let uid = document.getElementById('uid').value.trim().toUpperCase();
+    const uidInput = document.getElementById('uid');
+    let uid = uidInput.value.trim().toUpperCase();
 
     if (!/^[0-9A-F]{10}$/.test(uid)) {
-        alert("UID moet 10 hex tekens zijn");
+        showGlobalError("UID must be 10 hex characters");
         return;
     }
 
-    await fetch('/add?uid=' + uid);
-
-    document.getElementById('uid').value = "";
-    loadCards();
+    try {
+        setBusy(true);
+        showGlobalError('');
+        const result = await apiFetch('/add?uid=' + uid);
+        uidInput.value = "";
+        setStatus(result === 'ok' ? 'Card added.' : result);
+        await refresh();
+    } catch (err) {
+        showGlobalError('Failed to add card: ' + err.message);
+    } finally {
+        setBusy(false);
+    }
 }
 
 // ===== LEARN =====
 async function learn() {
-    await fetch('/learn');
-    setStatus("Scan nu een kaart...");
+    try {
+        setBusy(true);
+        showGlobalError('');
+        await apiFetch('/learn');
+        markLearnModeActive();
+        setStatus("Present a card now...");
+        await refresh();
+    } catch (err) {
+        showGlobalError('Failed to start learn mode: ' + err.message);
+    } finally {
+        setBusy(false);
+    }
 }
 
 // ===== DOOR =====
-function openDoor() {
-    fetch('/open')
-        .then(res => res.text())
-        .then(txt => setStatus(txt));
-}
-
-// ===== STATUS =====
-function setStatus(msg) {
-    document.getElementById('status').innerText = msg;
+async function openDoor() {
+    try {
+        setBusy(true);
+        showGlobalError('');
+        const txt = await apiFetch('/open');
+        markDoorActive();
+        setStatus(txt);
+        await refresh();
+    } catch (err) {
+        showGlobalError('Failed to trigger door: ' + err.message);
+    } finally {
+        setBusy(false);
+    }
 }
 
 // ===== REFRESH =====
-function refresh() {
-    loadCards();
-    loadLog();
+async function refresh() {
+    try {
+        showGlobalError('');
+        await Promise.all([
+            loadCards(),
+            loadLog(),
+            loadReaderStatus()
+        ]);
+    } catch (err) {
+        showGlobalError('Refresh failed: ' + err.message);
+    }
 }
 
 // initial load
+renderStatus();
 refresh();
 
 // auto refresh
